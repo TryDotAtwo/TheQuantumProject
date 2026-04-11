@@ -1,0 +1,15 @@
+outputs/
+checkpoints/
+*.pt
+*.pth
+*.bin
+*.ckpt
+*.safetensors
+*.zip
+*.7z
+*.csv
+__pycache__/
+.pycache_check
+apikey.json
+outputs/
+*.npy
