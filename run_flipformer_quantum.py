@@ -4,20 +4,19 @@ import argparse
 import json
 from pathlib import Path
 
-import torch
-
 from flipformer_q.config import Config
+from flipformer_q.checkpoint import load_model_weights
 from flipformer_q.data import write_sharded_dataset
 from flipformer_q.evolution import build_model, evolutionary_self_training, evaluate_individual
 from flipformer_q.pipeline import iterative_self_training, run_stage
 from flipformer_q.reporting import make_compare_plots
 from flipformer_q.train import train_model
+from flipformer_q.utils.runtime import resolve_device, seed_everything
 
 
 def add_common_config(parser):
     parser.add_argument("--n", type=int, default=30)
     parser.add_argument("--train-samples", type=int, default=100000)
-    parser.add_argument("--val-samples", type=int, default=5000)
     parser.add_argument("--benchmark-samples", type=int, default=200)
     parser.add_argument("--shard-size", type=int, default=5000)
     parser.add_argument("--seed", type=int, default=123456)
@@ -39,7 +38,7 @@ def add_common_config(parser):
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--num-workers", type=int, default=4)
 
-    parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--device", type=str, default="auto", help="auto, cpu, cuda, or cuda:N")
 
     parser.add_argument("--beam-width", type=int, default=48)
     parser.add_argument("--beam-depth", type=int, default=96)
@@ -52,8 +51,6 @@ def add_common_config(parser):
     parser.add_argument("--quantum-qubits", type=int, default=4)
     parser.add_argument("--quantum-layers", type=int, default=2)
 
-    parser.add_argument("--out-dir", type=str, default="outputs")
-
     parser.add_argument("--selftrain-rounds", type=int, default=3)
     parser.add_argument("--patience", type=int, default=2)
 
@@ -65,7 +62,6 @@ def args_to_config(args) -> Config:
     return Config(
         n=args.n,
         train_samples=args.train_samples,
-        val_samples=args.val_samples,
         benchmark_samples=args.benchmark_samples,
         shard_size=args.shard_size,
         seed=args.seed,
@@ -92,7 +88,6 @@ def args_to_config(args) -> Config:
         quantum_mode=args.quantum_mode,
         quantum_qubits=args.quantum_qubits,
         quantum_layers=args.quantum_layers,
-        out_dir=args.out_dir,
         selftrain_rounds=args.selftrain_rounds,
         patience=args.patience,
         log_every=args.log_every,
@@ -101,34 +96,30 @@ def args_to_config(args) -> Config:
     ).validate()
 
 
-def pick_device(cfg: Config) -> torch.device:
-    if cfg.device == "cuda" and torch.cuda.is_available():
-        return torch.device("cuda")
-    return torch.device("cpu")
+def pick_device(cfg: Config):
+    return resolve_device(cfg.device)
 
 
 def load_ckpt_into_model(cfg: Config, ckpt_path: str | Path):
     device = pick_device(cfg)
     model = build_model(cfg).to(device)
-    payload = torch.load(ckpt_path, map_location=device)
-    state_dict = payload["model"] if isinstance(payload, dict) and "model" in payload else payload
-    model.load_state_dict(state_dict, strict=False)
+    load_model_weights(model, ckpt_path, map_location=device)
     model.eval()
     return model, device
 
 
 def command_generate(args):
     cfg = args_to_config(args)
+    dataset_mode = args.dataset_mode
+    if dataset_mode is None:
+        dataset_mode = "selftrain" if args.teacher_ckpt else "bootstrap"
 
     model = None
     device = pick_device(cfg)
-
-    if args.teacher_ckpt:
+    if dataset_mode != "bootstrap":
+        if not args.teacher_ckpt:
+            raise ValueError(f"dataset_mode={dataset_mode!r} requires --teacher-ckpt")
         model, device = load_ckpt_into_model(cfg, args.teacher_ckpt)
-
-    dataset_mode = args.dataset_mode
-    if dataset_mode is None:
-        dataset_mode = "selftrain" if model is not None else "bootstrap"
 
     manifest = write_sharded_dataset(
         cfg=cfg,
@@ -153,6 +144,7 @@ def command_generate(args):
 
 def command_train(args):
     cfg = args_to_config(args)
+    seed_everything(cfg.seed)
     model = build_model(cfg)
     final_ckpt = train_model(
         cfg,
@@ -160,6 +152,7 @@ def command_train(args):
         Path(args.manifest),
         Path(args.run_dir),
         init_ckpt=Path(args.init_ckpt) if args.init_ckpt else None,
+        resume_ckpt=Path(args.resume_ckpt) if args.resume_ckpt else None,
     )
     print(json.dumps({"final_ckpt": str(final_ckpt)}), flush=True)
 
@@ -173,6 +166,8 @@ def command_eval(args):
 
 def command_compare(args):
     cfg = args_to_config(args)
+    if cfg.quantum_mode == "none":
+        raise ValueError("compare always runs the hybrid path; select --quantum-mode aer_cpu or aer_gpu")
     out_dir = Path(args.run_dir) / "compare"
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -205,6 +200,7 @@ def command_evolve(args):
     cfg.elite_size = args.elite_size
     cfg.generations = args.generations
     cfg.patience = args.patience
+    cfg.validate()
 
     best = evolutionary_self_training(cfg, Path(args.run_dir))
     print(
@@ -248,7 +244,7 @@ def main():
     p.add_argument(
         "--dataset-mode",
         type=str,
-        choices=["bootstrap", "selftrain", "distill", "stage3"],
+        choices=["bootstrap", "selftrain", "distill"],
         default=None,
     )
     p.set_defaults(func=command_generate)
@@ -257,7 +253,9 @@ def main():
     add_common_config(p)
     p.add_argument("--manifest", type=str, required=True)
     p.add_argument("--run-dir", type=str, required=True)
-    p.add_argument("--init-ckpt", type=str, default=None)
+    ckpt_group = p.add_mutually_exclusive_group()
+    ckpt_group.add_argument("--init-ckpt", type=str, default=None, help="Warm start from model weights; optimizer starts fresh")
+    ckpt_group.add_argument("--resume", dest="resume_ckpt", type=str, default=None, help="Resume optimizer, scaler, epoch, and RNG state")
     p.set_defaults(func=command_train)
 
     p = sub.add_parser("eval")
@@ -286,7 +284,7 @@ def main():
     p = sub.add_parser("stage-run")
     add_common_config(p)
     p.add_argument("--run-dir", type=str, required=True)
-    p.add_argument("--stage", type=str, choices=["seed", "selftrain", "distill", "quantum"], required=True)
+    p.add_argument("--stage", type=str, choices=["seed", "selftrain", "distill"], required=True)
     p.add_argument("--teacher-ckpt", type=str, default=None)
     p.add_argument("--round-idx", type=int, default=0)
     p.set_defaults(func=command_stage_run)

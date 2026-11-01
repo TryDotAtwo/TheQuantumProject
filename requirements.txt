@@ -1,5 +1,2 @@
 numpy>=1.26
 torch>=2.2
-matplotlib>=3.8
-qiskit>=2.0
-qiskit-aer>=0.17

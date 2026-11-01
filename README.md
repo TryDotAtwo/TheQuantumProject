@@ -1,133 +1,62 @@
-# Flipformer + local quantum emulator
+# Flipformer pancake-sorting experiments
 
-Локальный исследовательский пакет для pancake sorting без внешних датасетов.
+This repository contains a research prototype for sorting permutations with **prefix reversals** (the pancake-sorting problem), for `10 <= n <= 60`.
 
-Архитектура:
-- `Flipformer`: AF2-like `single stream + pair stream + recycling + flip-aware heads`
-- `beam search`: и для teacher-label generation, и для inference
-- `local quantum emulator`: Qiskit Aer CPU/GPU для reranking top-K actions
-- `self-training`: bootstrap -> self-train -> evaluate -> accept/reject
-- `evolution`: population of 8 models, crossover, mutation, lineage graph
+The model uses single-position and pair-position features with policy, action-cost (`q`), and state-cost (`value`) heads. Search is approximate beam search. Bootstrap targets use a gap-based heuristic; self-training uses one model-guided beam search per generated example to choose a teacher action. Neither target is an exact distance oracle, and the search has no optimality or completeness guarantee.
 
-## Ограничения v1
+The optional Qiskit Aer circuit supplies features for local action reranking. It is not a trainable variational quantum model, and this repository makes no claim that the quantum path improves solution quality or speed. A requested Aer backend fails explicitly if it cannot initialize; GPU requests do not fall back to CPU.
 
-1. Для произвольного `n` система не строит exact labels повсюду.  
-   Teacher labels для больших `n` строятся из beam-search под текущей моделью; следовательно это self-improving approximate solver, не exact oracle.
+## Install
 
-2. Полный `1,000,000` samples поддерживается через sharded `.npz`, но wall-clock зависит от beam settings и GPU.
-
-3. Quantum block не обучается как variational circuit end-to-end.  
-   Quantum block используется как local Aer-based feature extractor/reranker. Такая схема нужна, чтобы сначала стабильно отладить архитектуру.
-
-4. На GPU квантовая эмуляция работает только при корректной установке Aer с GPU support.  
-   В документации Qiskit Aer указано, что `AerSimulator` поддерживает GPU для `statevector`-метода, а `save_statevector()` позволяет сохранить состояние симуляции; Aer также предоставляет свои primitives для симуляции. citeturn539630search15turn539630search1turn539630search11
-
-## Структура
-
-- `flipformer_q/model.py` — Flipformer
-- `flipformer_q/search.py` — beam search + teacher targets
-- `flipformer_q/data.py` — local dataset shards
-- `flipformer_q/quantum/aer_emulator.py` — Qiskit Aer emulator
-- `flipformer_q/train.py` — supervised training
-- `flipformer_q/evolution.py` — self-training + genetic loop
-- `run_flipformer_quantum.py` — CLI
-
-## Быстрый старт
-
-### 1. Bootstrap dataset
+Core CPU training and classical search:
 
 ```bash
-python run_flipformer_quantum.py generate \
-  --n 30 \
-  --train-samples 20000 \
-  --shard-size 5000 \
-  --scramble-min 10 \
-  --scramble-max 80 \
-  --dataset-dir outputs/ds_bootstrap_n30
+python -m pip install -r requirements.txt
 ```
 
-### 2. Train first model
+Plots and quantum reranking are optional:
 
 ```bash
-python run_flipformer_quantum.py train \
-  --n 30 \
-  --manifest outputs/ds_bootstrap_n30/manifest.json \
-  --run-dir outputs/run_bootstrap_n30 \
-  --epochs 2 \
-  --batch-size 64 \
-  --device cuda
+python -m pip install -r requirements-plots.txt
+python -m pip install -r requirements-quantum.txt
 ```
 
-### 3. Generate self-train dataset with current model
+`--device auto` selects CUDA when available and CPU otherwise. An explicit `--device cuda` or `--device cuda:N` errors if that device is unavailable.
+
+## Workflow
+
+Generate a local bootstrap dataset:
 
 ```bash
-python run_flipformer_quantum.py generate \
-  --n 30 \
-  --train-samples 50000 \
-  --shard-size 5000 \
-  --dataset-dir outputs/ds_self_n30 \
-  --teacher-ckpt outputs/run_bootstrap_n30/model_last.pt \
-  --device cuda
+python run_flipformer_quantum.py generate --n 30 --train-samples 20000 --shard-size 5000 --scramble-min 10 --scramble-max 80 --dataset-dir outputs/bootstrap_n30
 ```
 
-### 4. Continue training from previous checkpoint
+Train a first model:
 
 ```bash
-python run_flipformer_quantum.py train \
-  --n 30 \
-  --manifest outputs/ds_self_n30/manifest.json \
-  --run-dir outputs/run_self_n30 \
-  --init-ckpt outputs/run_bootstrap_n30/model_last.pt \
-  --epochs 2 \
-  --batch-size 64 \
-  --device cuda
+python run_flipformer_quantum.py train --n 30 --manifest outputs/bootstrap_n30/manifest.json --run-dir outputs/run_n30 --epochs 2 --batch-size 64
 ```
 
-### 5. Compare classical vs hybrid
+`--init-ckpt` loads compatible model weights and starts a fresh optimizer. `--resume` restores a full training checkpoint, including optimizer, AMP scaler, epoch, and random-number-generator state. Resume checkpoints are written atomically at epoch boundaries to `model_last.pt`; `--epochs` means additional epochs. Older weights-only checkpoints can be warm-started but cannot provide a full resume.
+
+Evaluate the model with the same seeded benchmark states across comparison modes:
 
 ```bash
-python run_flipformer_quantum.py compare \
-  --n 30 \
-  --run-dir outputs/compare_n30 \
-  --cls-ckpt outputs/run_self_n30/model_last.pt \
-  --hybrid-ckpt outputs/run_self_n30/model_last.pt \
-  --benchmark-samples 200 \
-  --quantum-mode aer_gpu \
-  --device cuda
+python run_flipformer_quantum.py compare --n 30 --run-dir outputs/compare_n30 --cls-ckpt outputs/run_n30/model_last.pt --hybrid-ckpt outputs/run_n30/model_last.pt --quantum-mode aer_cpu
 ```
 
-### 6. Evolutionary self-training
+Hybrid evaluation requires `--quantum-mode aer_cpu` or `aer_gpu`. The result records the requested and actual backend. Trial output distinguishes solved solution length from the partial depth of unsolved searches. Mean solution length covers solved trials only and is `null` when none were solved.
 
-```bash
-python run_flipformer_quantum.py evolve \
-  --n 30 \
-  --run-dir outputs/evolve_n30 \
-  --train-samples 100000 \
-  --shard-size 10000 \
-  --benchmark-samples 200 \
-  --population-size 8 \
-  --elite-size 2 \
-  --generations 5 \
-  --patience 2 \
-  --device cuda \
-  --quantum-mode none
-```
+Other entry points are `stage-run`, `iterative`, and `evolve`. Run `python run_flipformer_quantum.py <command> --help` for their options.
 
-## На что смотреть
+## Data format
 
-- `outputs/.../train_metrics.csv`
-- `outputs/.../eval/trials_*.csv`
-- `outputs/.../compare/*png`
-- `outputs/.../lineage_graph.json`
+Datasets use sharded `.npy` arrays and a JSON manifest whose shard paths are relative to the manifest. Legacy `.npz` shards are still readable. The bundled `test_ds` files are small fixtures for data-format inspection, not evidence of model quality or a full-scale run.
 
-## Когда включать quantum mode
+## Known limits
 
-Сначала:
-- `--quantum-mode none`
-
-Потом:
-- `--quantum-mode aer_cpu`  
-или
-- `--quantum-mode aer_gpu`
-
-Qiskit Aer — high-performance simulator; IBM docs показывают использование Aer primitives и Aer simulator для exact/noisy local simulation, а Aer docs описывают `AerSimulator(method="statevector", device="GPU")` и `save_statevector()` для получения состояния. citeturn539630search11turn539630search15turn539630search1turn539630search9
+- Teacher labels are approximate and depend on the current model and beam settings.
+- Evolution ranks candidates by solved rate, solution length on solved trials, gap heuristic on unsolved terminal states, and expanded-node cost. The gap term is a search proxy, not an exact remaining distance.
+- Search quality and runtime depend on `n`, beam width/depth, hardware, and reranking settings.
+- Benchmark scores are comparative heuristics for this prototype; they are not certificates of optimality.
+- No full-scale sample-count, throughput, or quantum advantage claim is made by this repository.

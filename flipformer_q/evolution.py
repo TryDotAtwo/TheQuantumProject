@@ -9,14 +9,17 @@ import numpy as np
 import torch
 
 from .config import Config
+from .checkpoint import load_checkpoint, load_model_weights, model_state_dict, save_checkpoint_payload
 from .data import write_sharded_dataset
+from .domain import gap_heuristic
 from .model import FlipformerModel
 from .quantum.aer_emulator import QuantumFeatureEmulator
-from .reporting import make_compare_plots, write_summary_csv
+from .reporting import write_summary_csv
 from .search import beam_search
 from .train import train_model
 from .utils.io_utils import save_json
 from .utils.logging_utils import JsonlLogger, ProgressPrinter
+from .utils.runtime import derive_seed, resolve_device, seed_everything
 
 
 @dataclass
@@ -28,7 +31,8 @@ class Individual:
     ckpt: Optional[Path]
     score: float = -1e18
     solved_rate: float = 0.0
-    mean_length: float = 0.0
+    mean_length: Optional[float] = None
+    mean_unsolved_gap: Optional[float] = None
     mean_nodes: float = 0.0
 
 
@@ -51,6 +55,8 @@ def build_model(cfg: Config) -> FlipformerModel:
 
 
 def mutate_state_dict(state_dict: Dict[str, torch.Tensor], scale: float = 0.02) -> Dict[str, torch.Tensor]:
+    if scale < 0.0:
+        raise ValueError(f"mutation scale must be nonnegative, got {scale}")
     out = {}
     for k, v in state_dict.items():
         out[k] = v.clone() if not torch.is_floating_point(v) else v + scale * torch.randn_like(v)
@@ -58,30 +64,51 @@ def mutate_state_dict(state_dict: Dict[str, torch.Tensor], scale: float = 0.02) 
 
 
 def crossover_state_dict(a: Dict[str, torch.Tensor], b: Dict[str, torch.Tensor], alpha: float = 0.5) -> Dict[str, torch.Tensor]:
+    if a.keys() != b.keys():
+        raise ValueError("Cannot cross over models with different state-dictionary keys")
+    if not 0.0 <= alpha <= 1.0:
+        raise ValueError(f"alpha must be in [0, 1], got {alpha}")
     out = {}
     for k in a.keys():
         va, vb = a[k], b[k]
+        if va.shape != vb.shape or va.dtype != vb.dtype:
+            raise ValueError(f"Cannot cross over incompatible tensors at {k!r}: {va.shape}/{vb.shape} vs {va.dtype}/{vb.dtype}")
         out[k] = alpha * va + (1.0 - alpha) * vb if torch.is_floating_point(va) and torch.is_floating_point(vb) else va.clone()
     return out
 
 
-def evaluate_individual(cfg: Config, ckpt: Path, out_dir: Path, mode: str = "classical") -> Dict[str, float]:
-    device = torch.device(cfg.device if torch.cuda.is_available() and cfg.device == "cuda" else "cpu")
+def score_from_metrics(metrics: Dict[str, object]) -> float:
+    mean_length = metrics["mean_length"]
+    length_penalty = 0.02 * float(mean_length) if mean_length is not None else 0.0
+    solved_rate = float(metrics["solved_rate"])
+    unsolved_gap = metrics.get("mean_unsolved_gap")
+    residual_penalty = 0.02 * (1.0 - solved_rate) * float(unsolved_gap) if unsolved_gap is not None else 0.0
+    return 5.0 * solved_rate - length_penalty - residual_penalty - 0.0002 * float(metrics["mean_nodes"])
+
+
+def evaluate_individual(cfg: Config, ckpt: Path, out_dir: Path, mode: str = "classical") -> Dict[str, object]:
+    if mode not in {"classical", "hybrid"}:
+        raise ValueError(f"Unsupported evaluation mode: {mode}")
+    cfg.validate()
+    device = resolve_device(cfg.device)
     model = build_model(cfg).to(device)
-    state = torch.load(ckpt, map_location=device)
-    model.load_state_dict(state["model"], strict=False)
+    load_model_weights(model, ckpt, map_location=device)
     model.eval()
 
     rows = []
     rng = random.Random(cfg.seed + 999)
     quantum = None
     if mode == "hybrid":
+        if cfg.quantum_mode == "none":
+            raise ValueError("Hybrid evaluation requires --quantum-mode aer_cpu or aer_gpu")
         quantum = QuantumFeatureEmulator(
             n_qubits=cfg.quantum_qubits,
             n_layers=cfg.quantum_layers,
             mode=cfg.quantum_mode,
             cache_size=cfg.quantum_cache_size,
         )
+        if not quantum.is_available():
+            raise RuntimeError(f"Requested quantum backend {cfg.quantum_mode!r} is unavailable")
 
     from .domain import random_state
     prog = ProgressPrinter(f"eval {mode}", cfg.benchmark_samples, every_sec=2.0)
@@ -100,25 +127,52 @@ def evaluate_individual(cfg: Config, ckpt: Path, out_dir: Path, mode: str = "cla
             quantum_weight=cfg.quantum_weight,
             uncertainty_margin=cfg.uncertainty_margin,
         )
-        rows.append({"trial": t, "mode": mode, "solved": 1 if res.solved else 0, "path_len": len(res.path), "nodes_expanded": res.nodes_expanded, "q_calls": res.q_calls})
+        rows.append({
+            "trial": t,
+            "mode": mode,
+            "solved": 1 if res.solved else 0,
+            "solution_length": len(res.path) if res.solved else "",
+            "partial_depth": len(res.path) if not res.solved else "",
+            "final_gap": gap_heuristic(res.final_state),
+            "nodes_expanded": res.nodes_expanded,
+            "q_calls": res.q_calls,
+        })
         prog.update(t + 1, extra=f"solved={int(res.solved)} | path_len={len(res.path)} | nodes={res.nodes_expanded}")
     write_summary_csv(rows, out_dir / f"trials_{mode}.csv")
     solved_rate = float(np.mean([r["solved"] for r in rows]))
-    mean_length = float(np.mean([r["path_len"] for r in rows]))
+    solved_lengths = [int(r["solution_length"]) for r in rows if r["solution_length"] != ""]
+    mean_length = float(np.mean(solved_lengths)) if solved_lengths else None
+    partial_depths = [int(r["partial_depth"]) for r in rows if r["partial_depth"] != ""]
+    unsolved_gaps = [int(r["final_gap"]) for r in rows if r["solved"] == 0]
+    mean_partial_depth = float(np.mean(partial_depths)) if partial_depths else None
+    mean_unsolved_gap = float(np.mean(unsolved_gaps)) if unsolved_gaps else None
     mean_nodes = float(np.mean([r["nodes_expanded"] for r in rows]))
-    score = 5.0 * solved_rate - 0.02 * mean_length - 0.0002 * mean_nodes
+    metrics = {
+        "score": 0.0,
+        "solved_rate": solved_rate,
+        "mean_length": mean_length,
+        "mean_partial_depth": mean_partial_depth,
+        "mean_unsolved_gap": mean_unsolved_gap,
+        "mean_nodes": mean_nodes,
+        "quantum_backend": quantum.mode if quantum is not None else None,
+        "requested_device": cfg.device,
+        "device": str(device),
+    }
+    metrics["score"] = score_from_metrics(metrics)
     del model
     if device.type == "cuda":
         torch.cuda.empty_cache()
-    return {"score": score, "solved_rate": solved_rate, "mean_length": mean_length, "mean_nodes": mean_nodes}
+    return metrics
 
 
 def evolutionary_self_training(cfg: Config, root_out_dir: Path):
+    cfg.validate()
     root_out_dir = Path(root_out_dir)
     root_out_dir.mkdir(parents=True, exist_ok=True)
     lineage_logger = JsonlLogger(root_out_dir / "lineage.jsonl")
     lineage = {"nodes": [], "edges": []}
-    device = torch.device(cfg.device if torch.cuda.is_available() and cfg.device == "cuda" else "cpu")
+    device = resolve_device(cfg.device)
+    evolution_rng = random.Random(derive_seed(cfg.seed, "evolution"))
 
     population: List[Individual] = [Individual(name=f"g0_m{i}", generation=0, parent_a=None, parent_b=None, ckpt=None) for i in range(cfg.population_size)]
     best_ind: Optional[Individual] = None
@@ -128,11 +182,11 @@ def evolutionary_self_training(cfg: Config, root_out_dir: Path):
     for gen in range(cfg.generations):
         evaluated: List[Individual] = []
         for ind in population:
-            stage_cfg = cfg.with_stage("seed" if gen == 0 and ind.ckpt is None else "selftrain")
+            stage_cfg = Config(**{**cfg.to_dict(), "seed": derive_seed(cfg.seed, "evolution", gen, ind.name)}).validate()
+            seed_everything(stage_cfg.seed)
             model = build_model(stage_cfg)
-            if ind.ckpt is not None and Path(ind.ckpt).exists():
-                state = torch.load(ind.ckpt, map_location="cpu")
-                model.load_state_dict(state["model"], strict=False)
+            if ind.ckpt is not None:
+                load_model_weights(model, ind.ckpt, map_location="cpu")
             dataset_dir = root_out_dir / "datasets" / ind.name
             manifest = write_sharded_dataset(
                 cfg=stage_cfg,
@@ -149,9 +203,18 @@ def evolutionary_self_training(cfg: Config, root_out_dir: Path):
             ind.score = metrics["score"]
             ind.solved_rate = metrics["solved_rate"]
             ind.mean_length = metrics["mean_length"]
+            ind.mean_unsolved_gap = metrics["mean_unsolved_gap"]
             ind.mean_nodes = metrics["mean_nodes"]
             evaluated.append(ind)
-            lineage["nodes"].append({"name": ind.name, "generation": gen, "score": ind.score, "solved_rate": ind.solved_rate, "mean_length": ind.mean_length, "mean_nodes": ind.mean_nodes})
+            lineage["nodes"].append({
+                "name": ind.name,
+                "generation": gen,
+                "score": ind.score,
+                "solved_rate": ind.solved_rate,
+                "mean_length": ind.mean_length,
+                "mean_unsolved_gap": ind.mean_unsolved_gap,
+                "mean_nodes": ind.mean_nodes,
+            })
             if ind.parent_a is not None:
                 lineage["edges"].append({"src": ind.parent_a, "dst": ind.name})
             if ind.parent_b is not None:
@@ -172,17 +235,23 @@ def evolutionary_self_training(cfg: Config, root_out_dir: Path):
         elites = evaluated[: cfg.elite_size]
         next_population: List[Individual] = [Individual(name=f"g{gen+1}_{e.name}_elite", generation=gen + 1, parent_a=e.name, parent_b=None, ckpt=e.ckpt) for e in elites]
         while len(next_population) < cfg.population_size:
-            pa, pb = random.sample(evaluated[: max(2, len(evaluated) // 2)], 2)
+            parents = evaluated[: max(2, len(evaluated) // 2)]
+            pa, pb = evolution_rng.sample(parents, 2)
             child = Individual(name=f"g{gen+1}_child{len(next_population)}", generation=gen + 1, parent_a=pa.name, parent_b=pb.name, ckpt=None)
+            child_seed = derive_seed(cfg.seed, "evolution-child", gen + 1, child.name)
+            seed_everything(child_seed)
             ma = build_model(cfg)
-            sa = torch.load(pa.ckpt, map_location="cpu")["model"]
-            sb = torch.load(pb.ckpt, map_location="cpu")["model"]
-            state = mutate_state_dict(crossover_state_dict(sa, sb, alpha=random.uniform(0.35, 0.65)), scale=0.02)
-            ma.load_state_dict(state, strict=False)
+            sa = model_state_dict(load_checkpoint(pa.ckpt, map_location="cpu"))
+            sb = model_state_dict(load_checkpoint(pb.ckpt, map_location="cpu"))
+            state = mutate_state_dict(
+                crossover_state_dict(sa, sb, alpha=evolution_rng.uniform(0.35, 0.65)),
+                scale=0.02,
+            )
+            ma.load_state_dict(state, strict=True)
             child_dir = root_out_dir / "init_children"
             child_dir.mkdir(parents=True, exist_ok=True)
             ckpt = child_dir / f"{child.name}.pt"
-            torch.save({"model": ma.state_dict(), "cfg": cfg.to_dict(), "epoch": 0}, ckpt)
+            save_checkpoint_payload(ckpt, {"model": ma.state_dict(), "cfg": cfg.to_dict(), "epoch": 0})
             child.ckpt = ckpt
             next_population.append(child)
         population = next_population

@@ -1,15 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, asdict
-from pathlib import Path
+import math
+from dataclasses import asdict, dataclass
 from typing import Literal
 
 
 QuantumMode = Literal["none", "aer_cpu", "aer_gpu"]
-DatasetMode = Literal["bootstrap", "selftrain", "distill", "stage3"]
-StageMode = Literal["seed", "selftrain", "distill", "quantum"]
-SelectionMetric = Literal["score", "solved_rate", "mean_length"]
-
 MIN_SUPPORTED_N = 10
 MAX_SUPPORTED_N = 60
 
@@ -18,7 +14,6 @@ MAX_SUPPORTED_N = 60
 class Config:
     n: int = 30
     train_samples: int = 100000
-    val_samples: int = 5000
     benchmark_samples: int = 200
     shard_size: int = 5000
     seed: int = 123456
@@ -57,26 +52,14 @@ class Config:
 
     population_size: int = 8
     elite_size: int = 2
-    offspring_per_generation: int = 6
     generations: int = 5
     patience: int = 2
 
     selftrain_rounds: int = 3
     accept_margin: float = 1e-4
-    stage_mode: StageMode = "seed"
-
-    lambda_value: float = 1.0
-    lambda_policy: float = 1.0
-    lambda_q: float = 0.75
-    lambda_far: float = 0.5
-    lambda_rank: float = 0.25
 
     num_workers: int = 4
-    device: str = "cuda"
-    out_dir: str = "outputs"
-
-    def output_path(self) -> Path:
-        return Path(self.out_dir)
+    device: str = "auto"
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -84,46 +67,51 @@ class Config:
     def validate(self) -> "Config":
         if not MIN_SUPPORTED_N <= self.n <= MAX_SUPPORTED_N:
             raise ValueError(f"n must be in [{MIN_SUPPORTED_N}, {MAX_SUPPORTED_N}], got {self.n}")
+        if self.train_samples <= 0 or self.benchmark_samples <= 0 or self.shard_size <= 0:
+            raise ValueError("train_samples, benchmark_samples, and shard_size must be positive")
+        if self.scramble_min < 1 or self.scramble_max < self.scramble_min:
+            raise ValueError("scramble bounds must satisfy 1 <= scramble_min <= scramble_max")
         if self.d_model <= 0 or self.d_pair <= 0:
-            raise ValueError(f"d_model and d_pair must be positive, got d_model={self.d_model}, d_pair={self.d_pair}")
+            raise ValueError("d_model and d_pair must be positive")
         if self.n_heads <= 0 or self.d_model % self.n_heads != 0:
-            raise ValueError(f"d_model must be divisible by n_heads, got d_model={self.d_model}, n_heads={self.n_heads}")
+            raise ValueError("d_model must be positive and divisible by n_heads")
         if self.d_pair > self.d_model:
-            raise ValueError(f"d_pair must be <= d_model, got d_pair={self.d_pair}, d_model={self.d_model}")
+            raise ValueError("d_pair must be <= d_model")
         if self.n_blocks <= 0 or self.recycle_steps <= 0:
-            raise ValueError(f"n_blocks and recycle_steps must be positive, got n_blocks={self.n_blocks}, recycle_steps={self.recycle_steps}")
+            raise ValueError("n_blocks and recycle_steps must be positive")
         if self.mlp_mult < 1 or self.head_mlp_mult < 1:
-            raise ValueError(f"mlp_mult and head_mlp_mult must be >= 1, got mlp_mult={self.mlp_mult}, head_mlp_mult={self.head_mlp_mult}")
+            raise ValueError("mlp multipliers must be positive")
+        if not math.isfinite(self.dropout) or not 0.0 <= self.dropout < 1.0:
+            raise ValueError("dropout must be in [0, 1)")
         if self.batch_size <= 0 or self.micro_batch_size < 0:
-            raise ValueError(f"batch_size must be positive and micro_batch_size must be >= 0, got batch_size={self.batch_size}, micro_batch_size={self.micro_batch_size}")
+            raise ValueError("batch_size must be positive and micro_batch_size must be nonnegative")
+        if self.epochs <= 0 or not math.isfinite(self.lr) or self.lr <= 0 or not math.isfinite(self.weight_decay) or self.weight_decay < 0:
+            raise ValueError("epochs and lr must be positive; weight_decay must be nonnegative")
+        if (
+            not math.isfinite(self.clip_grad_norm)
+            or self.clip_grad_norm < 0
+            or self.log_every <= 0
+            or self.num_workers < 0
+        ):
+            raise ValueError("clip_grad_norm and num_workers must be nonnegative; log_every must be positive")
+        if self.beam_width <= 0 or self.beam_depth <= 0 or self.expand_topk <= 0:
+            raise ValueError("beam_width, beam_depth, and expand_topk must be positive")
+        if self.rerank_topk < 0 or self.quantum_cache_size < 0:
+            raise ValueError("rerank_topk and quantum_cache_size must be nonnegative")
+        if self.quantum_qubits <= 0 or self.quantum_layers < 0:
+            raise ValueError("quantum_qubits must be positive and quantum_layers nonnegative")
+        if not math.isfinite(self.quantum_weight) or self.quantum_weight < 0:
+            raise ValueError("quantum_weight must be finite and nonnegative")
+        if self.quantum_mode not in {"none", "aer_cpu", "aer_gpu"}:
+            raise ValueError(f"Unsupported quantum_mode: {self.quantum_mode}")
+        if self.population_size < 2 or not 1 <= self.elite_size < self.population_size:
+            raise ValueError("evolution requires population_size >= 2 and 1 <= elite_size < population_size")
+        if self.generations <= 0 or self.patience <= 0 or self.selftrain_rounds <= 0:
+            raise ValueError("generations, patience, and selftrain_rounds must be positive")
+        if not math.isfinite(self.accept_margin) or self.accept_margin < 0:
+            raise ValueError("accept_margin must be finite and nonnegative")
+        if not math.isfinite(self.uncertainty_margin) or not 0.0 <= self.uncertainty_margin <= 1.0:
+            raise ValueError("uncertainty_margin must be in [0, 1]")
+        if not self.device.strip():
+            raise ValueError("device must be a nonempty device name")
         return self
-
-    def with_stage(self, stage: StageMode) -> "Config":
-        d = self.to_dict()
-        d["stage_mode"] = stage
-        cfg = Config(**d)
-        if stage == "seed":
-            cfg.lambda_value = 1.0
-            cfg.lambda_policy = 0.0
-            cfg.lambda_q = 1.0
-            cfg.lambda_far = 0.0
-            cfg.lambda_rank = 0.0
-        elif stage == "selftrain":
-            cfg.lambda_value = 1.0
-            cfg.lambda_policy = 0.25
-            cfg.lambda_q = 0.75
-            cfg.lambda_far = 0.0
-            cfg.lambda_rank = 0.10
-        elif stage == "distill":
-            cfg.lambda_value = 1.0
-            cfg.lambda_policy = 0.75
-            cfg.lambda_q = 1.0
-            cfg.lambda_far = 0.35
-            cfg.lambda_rank = 0.20
-        elif stage == "quantum":
-            cfg.lambda_value = 1.0
-            cfg.lambda_policy = 1.0
-            cfg.lambda_q = 1.0
-            cfg.lambda_far = 0.50
-            cfg.lambda_rank = 0.25
-        return cfg

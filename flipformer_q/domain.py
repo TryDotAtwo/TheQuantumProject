@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import random
-from typing import Iterable, List, Sequence, Tuple
+from typing import List, Sequence, Tuple
 
 import numpy as np
 
@@ -18,6 +18,8 @@ def all_actions(n: int) -> List[int]:
 
 
 def apply_flip(state: Sequence[int], k: int) -> State:
+    if not 2 <= k <= len(state):
+        raise ValueError(f"flip length must be in [2, {len(state)}], got {k}")
     return tuple(list(state[:k])[::-1] + list(state[k:]))
 
 
@@ -62,14 +64,6 @@ def gap_heuristic(state: Sequence[int]) -> int:
     return gaps
 
 
-def adjacency_breaks(state: Sequence[int]) -> int:
-    out = 0
-    for i in range(len(state) - 1):
-        if state[i + 1] != state[i] + 1:
-            out += 1
-    return out
-
-
 def suffix_sorted_len(state: Sequence[int]) -> int:
     n = len(state)
     out = 0
@@ -79,13 +73,3 @@ def suffix_sorted_len(state: Sequence[int]) -> int:
         else:
             break
     return out
-
-
-def heuristic_value(state: Sequence[int]) -> float:
-    n = len(state)
-    gaps = gap_heuristic(state)
-    br = adjacency_breaks(state)
-    suf = suffix_sorted_len(state)
-    inv = inverse_permutation(state)
-    pos_err = float(np.abs(inv - np.arange(n)).mean())
-    return 1.25 * gaps + 0.65 * br + 0.08 * pos_err - 0.10 * suf

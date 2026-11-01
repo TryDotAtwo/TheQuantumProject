@@ -4,7 +4,7 @@
   "shard_size": 10,
   "dataset_mode": "bootstrap",
   "shards": [
-    "/mnt/data/flipformer_quantum_local/test_ds/shard_00000.npz",
-    "/mnt/data/flipformer_quantum_local/test_ds/shard_00001.npz"
+    "shard_00000.npz",
+    "shard_00001.npz"
   ]
 }

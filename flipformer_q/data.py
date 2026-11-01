@@ -5,22 +5,22 @@ import json
 import random
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 import numpy as np
 import torch
 from torch.utils.data import Dataset
 
 from .config import Config
-from .domain import State, all_actions, random_scramble_depth, random_state
-from .features import action_features, state_pair_features, state_single_features
+from .domain import State, all_actions, apply_flip, gap_heuristic, random_scramble_depth, random_state
+from .features import all_action_features, state_pair_features, state_single_features
 from .search import beam_teacher_targets
+from .utils.io_utils import save_json
 from .utils.logging_utils import ProgressPrinter
 
 
 @dataclass
 class Example:
-    state: State
     single: np.ndarray
     pair: np.ndarray
     action_feats: np.ndarray
@@ -39,17 +39,7 @@ INT_SHARD_ARRAY_KEYS = {"scramble"}
 
 def bootstrap_targets(state: State):
     actions = all_actions(len(state))
-    q = []
-    for a in actions:
-        nxt = list(state[:a])[::-1] + list(state[a:])
-        gap = 0
-        ext = list(nxt) + [len(state) + 1]
-        for i in range(len(ext) - 1):
-            if abs(ext[i] - ext[i + 1]) != 1:
-                gap += 1
-        q.append(float(gap))
-
-    q = np.asarray(q, dtype=np.float32)
+    q = np.asarray([gap_heuristic(apply_flip(state, action)) for action in actions], dtype=np.float32)
     best = float(q.min())
     opt = (q <= best + 1e-6).astype(np.float32)
     policy = opt / max(float(opt.sum()), 1.0)
@@ -65,14 +55,16 @@ def generate_example(
     device: torch.device,
     dataset_mode: str = "bootstrap",
 ) -> Example:
+    if model is None and dataset_mode != "bootstrap":
+        raise ValueError(f"dataset_mode={dataset_mode!r} requires a teacher model")
     scramble = random_scramble_depth(rng, cfg.n, cfg.scramble_min, cfg.scramble_max)
     state = random_state(cfg.n, rng, scramble)
 
     single = state_single_features(state).astype(np.float32)
     pair = state_pair_features(state).astype(np.float32)
-    acts = np.stack([action_features(state, a) for a in all_actions(cfg.n)], axis=0).astype(np.float32)
+    acts = all_action_features(state).astype(np.float32)
 
-    if model is None or dataset_mode == "bootstrap":
+    if dataset_mode == "bootstrap":
         policy, q_values, far, value = bootstrap_targets(state)
     else:
         policy, q_values, far, value = beam_teacher_targets(
@@ -84,7 +76,6 @@ def generate_example(
         )
 
     return Example(
-        state=state,
         single=single,
         pair=pair,
         action_feats=acts,
@@ -105,11 +96,19 @@ def write_sharded_dataset(
     device: torch.device,
     dataset_mode: str = "bootstrap",
 ) -> Path:
+    cfg.validate()
+    if total_samples <= 0 or shard_size <= 0:
+        raise ValueError("total_samples and shard_size must be positive")
+    if dataset_mode not in {"bootstrap", "selftrain", "distill", "stage3"}:
+        raise ValueError(f"Unsupported dataset_mode: {dataset_mode}")
+    if model is None and dataset_mode != "bootstrap":
+        raise ValueError(f"dataset_mode={dataset_mode!r} requires a teacher model")
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     rng = random.Random(cfg.seed)
     n_shards = (total_samples + shard_size - 1) // shard_size
     manifest = {
+        "schema_version": 2,
         "n": int(cfg.n),
         "total_samples": int(total_samples),
         "shard_size": int(shard_size),
@@ -162,15 +161,18 @@ def write_sharded_dataset(
 
     manifest_path = out_dir / "manifest.json"
     manifest["storage"] = "npy_dir"
-    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    save_json(manifest, manifest_path)
     return manifest_path
 
 
-class ShardedNpzDataset(Dataset):
+class ShardedDataset(Dataset):
     def __init__(self, manifest_path: Path):
         super().__init__()
         self.manifest_path = Path(manifest_path)
         self.manifest = json.loads(self.manifest_path.read_text(encoding="utf-8"))
+        self.n = int(self.manifest["n"]) if "n" in self.manifest else None
+        if self.n is not None and self.n < 2:
+            raise ValueError(f"Manifest n must be at least 2, got {self.n}")
         raw_shards = self.manifest.get("shards", [])
         if not raw_shards:
             raise RuntimeError(f"No shards found in manifest: {self.manifest_path}")
@@ -198,11 +200,18 @@ class ShardedNpzDataset(Dataset):
                     with np.load(shard_path) as data:
                         size = int(data["single"].shape[0])
             size = int(size)
+            if size <= 0:
+                raise ValueError(f"Shard size must be positive, got {size}: {shard_path}")
             self.shards.append({"path": shard_path, "size": size})
             total += size
             self.cum_sizes.append(total)
 
         self.total_size = total
+        declared_total = self.manifest.get("total_samples")
+        if declared_total is not None and int(declared_total) != total:
+            raise ValueError(
+                f"Manifest total_samples={declared_total} but shard sizes sum to {total}: {self.manifest_path}"
+            )
         uses_npy_dirs = any(Path(entry["path"]).is_dir() for entry in self.shards)
         self._cache_limit = min(len(self.shards), 8) if uses_npy_dirs else 1
         self._cache_data_by_shard: Dict[int, Dict[str, np.ndarray]] = {}
@@ -211,14 +220,18 @@ class ShardedNpzDataset(Dataset):
     def _resolve_shard_path(self, raw_path: str | Path) -> Path:
         raw_path = Path(raw_path)
         if raw_path.is_absolute():
+            if raw_path.exists():
+                return raw_path.resolve()
+            portable_candidate = self.manifest_path.parent / raw_path.name
+            if portable_candidate.exists():
+                return portable_candidate.resolve()
             return raw_path.resolve()
-        cwd_candidate = raw_path.resolve()
-        if cwd_candidate.exists():
-            return cwd_candidate
-        manifest_name_candidate = (self.manifest_path.parent / raw_path.name).resolve()
-        if manifest_name_candidate.exists():
-            return manifest_name_candidate
-        return (self.manifest_path.parent / raw_path).resolve()
+
+        manifest_candidate = (self.manifest_path.parent / raw_path).resolve()
+        if manifest_candidate.exists():
+            return manifest_candidate
+        # Compatibility for legacy manifests whose relative paths were rooted at cwd.
+        return raw_path.resolve()
 
     def __len__(self) -> int:
         return self.total_size
@@ -245,6 +258,10 @@ class ShardedNpzDataset(Dataset):
             data = self._load_npy_shard(Path(shard_path))
         else:
             data = self._load_npz_shard(Path(shard_path))
+        expected_rows = int(self.shards[shard_idx]["size"])
+        actual_rows = int(data["single"].shape[0])
+        if actual_rows != expected_rows:
+            raise ValueError(f"Shard {shard_path} has {actual_rows} rows, manifest declares {expected_rows}")
 
         self._cache_data_by_shard[shard_idx] = data
         self._cache_order.append(shard_idx)
@@ -272,6 +289,37 @@ class ShardedNpzDataset(Dataset):
         missing = [key for key in REQUIRED_SHARD_ARRAY_KEYS if key not in data]
         if missing:
             raise RuntimeError(f"Shard {shard_path} missing arrays: {missing}")
+        if self.n is None:
+            return
+
+        expected = {
+            "single": (self.n, 8),
+            "pair": (self.n, self.n, 8),
+            "action_feats": (self.n - 1, 10),
+            "value": (),
+            "policy": (self.n - 1,),
+            "q_values": (self.n - 1,),
+            "far": (self.n - 1,),
+        }
+        row_count = None
+        for key, trailing_shape in expected.items():
+            array = data[key]
+            shape = tuple(array.shape)
+            if not shape:
+                raise ValueError(f"Shard array {key!r} has no sample dimension: {shard_path}")
+            if row_count is None:
+                row_count = shape[0]
+            elif shape[0] != row_count:
+                raise ValueError(f"Shard arrays have inconsistent row counts in {shard_path}")
+            if shape[1:] != trailing_shape:
+                expected_shape = (row_count, *trailing_shape)
+                raise ValueError(f"Shard array {key!r} has shape {shape}; expected {expected_shape}: {shard_path}")
+            if not np.issubdtype(array.dtype, np.number):
+                raise TypeError(f"Shard array {key!r} must be numeric, got {array.dtype}: {shard_path}")
+        if "scramble" in data:
+            scramble = data["scramble"]
+            if scramble.ndim != 1 or scramble.shape[0] != row_count:
+                raise ValueError(f"Shard array 'scramble' must have shape [{row_count}], got {scramble.shape}")
 
     def _to_tensor(self, key: str, value) -> torch.Tensor:
         tensor = torch.as_tensor(value)
@@ -328,3 +376,7 @@ class ShardedNpzDataset(Dataset):
                 batch_arrays[key][positions] = source[local_indices]
 
         return {key: self._to_tensor(key, value) for key, value in batch_arrays.items()}
+
+
+# Keep the old import name available to existing local scripts.
+ShardedNpzDataset = ShardedDataset

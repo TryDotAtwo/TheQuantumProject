@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import time
 from pathlib import Path
 from typing import Optional
@@ -10,7 +11,16 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from .config import Config
-from .data import ShardedNpzDataset
+from .checkpoint import (
+    load_checkpoint,
+    load_model_weights,
+    model_state_dict,
+    restore_training_state,
+    save_training_checkpoint,
+    validate_resume_compatibility,
+)
+from .data import ShardedDataset
+from .utils.runtime import resolve_device, seed_everything
 from .utils.logging_utils import ProgressPrinter, CsvLogger
 
 
@@ -39,16 +49,18 @@ def move_batch(batch, device: torch.device):
     return {k: v.to(device, non_blocking=True) for k, v in batch.items()}
 
 
-def dataset_mode_loss_weights(cfg: Config, dataset_mode: str) -> tuple[float, float, float, float, float]:
-    if dataset_mode == "bootstrap":
-        return 1.0, 0.0, 1.0, 0.0, 0.0
-    if dataset_mode == "selftrain":
-        return 1.0, 0.25, 0.75, 0.0, 0.10
-    if dataset_mode == "distill":
-        return 1.0, 0.75, 1.0, 0.35, 0.20
-    if dataset_mode == "stage3":
-        return 1.0, 1.0, 1.0, 0.50, 0.25
-    return cfg.lambda_value, cfg.lambda_policy, cfg.lambda_q, cfg.lambda_far, cfg.lambda_rank
+def dataset_mode_loss_weights(dataset_mode: str) -> tuple[float, float, float, float, float]:
+    """Central loss policy; stage3 remains readable for older manifests."""
+    weights = {
+        "bootstrap": (1.0, 0.0, 1.0, 0.0, 0.0),
+        "selftrain": (1.0, 0.25, 0.75, 0.0, 0.10),
+        "distill": (1.0, 0.75, 1.0, 0.35, 0.20),
+        "stage3": (1.0, 1.0, 1.0, 0.50, 0.25),
+    }
+    try:
+        return weights[dataset_mode]
+    except KeyError as exc:
+        raise ValueError(f"Unsupported dataset_mode {dataset_mode!r}; expected one of {sorted(weights)}") from exc
 
 
 def compute_losses(outputs, batch, weights):
@@ -148,26 +160,39 @@ def iter_micro_batches(batch, micro_batch_size: int):
         yield {key: value[start:end] for key, value in batch.items()}, end - start
 
 
-def train_model(cfg: Config, model, manifest_path: Path, out_dir: Path, init_ckpt: Optional[Path] = None):
+def train_model(
+    cfg: Config,
+    model,
+    manifest_path: Path,
+    out_dir: Path,
+    init_ckpt: Optional[Path] = None,
+    resume_ckpt: Optional[Path] = None,
+):
+    cfg.validate()
+    if init_ckpt is not None and resume_ckpt is not None:
+        raise ValueError("Choose either init_ckpt (weights-only warm start) or resume_ckpt (full resume), not both.")
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = Path(manifest_path)
-    device = torch.device(cfg.device if torch.cuda.is_available() and cfg.device == "cuda" else "cpu")
+    manifest_sha256 = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+    seed_everything(cfg.seed)
+    device = resolve_device(cfg.device)
     model = model.to(device)
-    if init_ckpt is not None and Path(init_ckpt).exists():
-        payload = torch.load(init_ckpt, map_location=device)
-        model.load_state_dict(payload["model"], strict=False)
+    if init_ckpt is not None:
+        load_model_weights(model, init_ckpt, map_location=device)
 
-    ds = ShardedNpzDataset(manifest_path)
+    ds = ShardedDataset(manifest_path)
     manifest_n = ds.manifest.get("n")
     if manifest_n is not None and int(manifest_n) != cfg.n:
         raise ValueError(f"Manifest n={manifest_n} does not match config n={cfg.n}: {manifest_path}")
     dataset_mode = ds.manifest.get("dataset_mode", "bootstrap")
-    weights = dataset_mode_loss_weights(cfg, dataset_mode)
+    weights = dataset_mode_loss_weights(dataset_mode)
     required_heads = heads_for_loss_weights(weights)
     micro_batch_size = resolve_micro_batch_size(cfg, device)
     grad_accum_steps = max(1, (cfg.batch_size + micro_batch_size - 1) // micro_batch_size)
 
+    loader_generator = torch.Generator()
+    loader_generator.manual_seed(cfg.seed)
     dl = DataLoader(
         ds,
         batch_size=cfg.batch_size,
@@ -178,10 +203,22 @@ def train_model(cfg: Config, model, manifest_path: Path, out_dir: Path, init_ckp
         persistent_workers=(cfg.num_workers > 0),
         prefetch_factor=2 if cfg.num_workers > 0 else None,
         drop_last=False,
+        generator=loader_generator,
     )
 
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     scaler = torch.amp.GradScaler("cuda", enabled=(cfg.amp and device.type == "cuda"))
+    start_epoch = 0
+    if resume_ckpt is not None:
+        resume_payload = load_checkpoint(resume_ckpt, map_location=device)
+        model.load_state_dict(model_state_dict(resume_payload), strict=True)
+        validate_resume_compatibility(
+            resume_payload,
+            cfg=cfg,
+            device=device,
+            manifest_sha256=manifest_sha256,
+        )
+        start_epoch = restore_training_state(resume_payload, opt, scaler, loader_generator)
     csv = CsvLogger(
         out_dir / "train_metrics.csv",
         [
@@ -201,6 +238,9 @@ def train_model(cfg: Config, model, manifest_path: Path, out_dir: Path, init_ckp
         "grad_accum_steps_estimate": grad_accum_steps,
         "total_batches": len(dl),
         "epochs": cfg.epochs,
+        "start_epoch": start_epoch,
+        "resume_mode": "full_resume" if resume_ckpt is not None else ("warm_start" if init_ckpt is not None else "fresh"),
+        "requested_device": cfg.device,
         "device": str(device),
         "num_workers": cfg.num_workers,
         "lr": cfg.lr,
@@ -212,7 +252,7 @@ def train_model(cfg: Config, model, manifest_path: Path, out_dir: Path, init_ckp
         "required_heads": sorted(required_heads),
     }), flush=True)
 
-    for epoch in range(1, cfg.epochs + 1):
+    for epoch in range(start_epoch + 1, start_epoch + cfg.epochs + 1):
         model.train()
         epoch_start = time.time()
         prog = ProgressPrinter(f"train epoch {epoch}/{cfg.epochs}", total=max(1, len(dl)), every_sec=2.0)
@@ -267,8 +307,16 @@ def train_model(cfg: Config, model, manifest_path: Path, out_dir: Path, init_ckp
         summary["epoch"] = epoch
         summary["seconds"] = time.time() - epoch_start
         print(json.dumps(summary), flush=True)
-        payload = {"model": model.state_dict(), "cfg": cfg.to_dict(), "epoch": epoch, "summary": summary}
-        torch.save(payload, out_dir / f"epoch_{epoch:03d}.pt")
-        torch.save(payload, out_dir / "model_last.pt")
+        save_training_checkpoint(
+            out_dir / "model_last.pt",
+            model=model,
+            optimizer=opt,
+            scaler=scaler,
+            loader_generator=loader_generator,
+            cfg=cfg,
+            epoch=epoch,
+            summary=summary,
+            runtime={"device": str(device), "manifest_sha256": manifest_sha256},
+        )
 
     return out_dir / "model_last.pt"

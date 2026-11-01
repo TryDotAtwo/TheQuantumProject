@@ -2,11 +2,9 @@ from __future__ import annotations
 
 import csv
 import json
-import math
 import time
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, Optional
+from typing import Dict, Iterable
 
 
 class ProgressPrinter:
